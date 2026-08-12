@@ -10,20 +10,30 @@ Big part of the iOS kernelcache is written by C++, which compiled into complicat
 
 # Installation
 
-1. Install  [ida_kernelcache(Cellebrite's fork)](https://github.com/cellebrite-srl/ida_kernelcache)
-1. Make sure `ida_kernelcache` and `ida_kcpp` are in IDA python path.
+- Install [ida_kernelcache (Cellebrite's fork)](https://github.com/cellebrite-labs/ida_kernelcache)
+- Optional, but highly recommended: install [ida-referee (Cellebrite's fork)](https://github.com/cellebrite-labs/ida-referee) for structs fields xrefs tracking from decompiler access
+
+Neither is on PyPI, so follow the installation instructions in their repos.
+
+With [ida-setup](https://github.com/cellebrite-labs/ida-setup):
+
+```bash
+ida-setup plugin install -e /path/to/ida-kcpp
+```
+
+Or manually:
+
+1. Install [ida-netnode](https://github.com/williballenthin/ida-netnode)
+2. Make sure `ida_kernelcache` and `ida_kcpp` are in IDA python path. 
 
 Could also be added by adding into `~/.idapro/idapythonrc.py`:
-
 ```python
 import sys
 sys.path.append(IDA_KCPP_PATH)
 sys.path.append(IDA_KERNELCACHE_PATH)
 ```
 
-2. clone the repository and symlink  `~/.idapro/plugins/ida_kcpp_plugin.py` to `ida_kcpp_plugin.py`
-2. Install [ida-netnode](https://github.com/williballenthin/ida-netnode)
-2. [Optional]: Install [ida-referee](https://github.com/joeleong/ida-referee) if decompiler structs fields xrefs tracking is required
+3. symlink  `~/.idapro/plugins/ida_kcpp_plugin.py` to `ida_kcpp_plugin.py`
 
 # Usage
 
@@ -67,9 +77,10 @@ The same goes for **virutal function prototype changing**. In this case, the rel
 
   ![image-20220707161129479](images/choose_vfunc.png)
 
-* Structures window:
+* Local Types view (Shift+F1):
 
-  * Double click on virtual method pops up the same window as in the decompiler
+  * Double click on virtual method navigates to implementation (note: IDA 9 also shows a rename dialog which can be dismissed)
+  * `Cmd+Enter` on virtual method also navigates to implementation (cleaner alternative to double-click)
   * Fixed an IDA bug that double-click on struct name that contains `::` won't jump.
 
 # Future improvements
@@ -80,4 +91,4 @@ The same goes for **virutal function prototype changing**. In this case, the rel
 # Meta
 
 Authored by Uriel Malin, Ievgen Solodovnykov and Omer Porzecanski of Cellebrite Labs.
-Developed and tested for IDA8.4/iOS 18.4 on macOS with python 3.10.2
+Developed and tested for IDA 9.2 on macOS with Python 3.13

@@ -89,6 +89,8 @@ class KCPPPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
         if not self.structs_double_colon_hook:
             self.structs_double_colon_hook = ui.StructsDoubleColonHooks()
         self.structs_double_colon_hook.hook()
+        # Register keyboard shortcut action
+        ui.JumpToVMethodHandler.register()
 
     def deactivate_hooks(self):
         if self.hexrays_hook:
@@ -97,6 +99,8 @@ class KCPPPlugin(idaapi.plugin_t, idaapi.UI_Hooks):
             self.virtual_synchronizer_hook.unhook()
         if self.structs_double_colon_hook:
             self.structs_double_colon_hook.unhook()
+        # Unregister keyboard shortcut action
+        ui.JumpToVMethodHandler.unregister()
 
     def activate_plugin(self):
         logging.info("KernelCache CPP plugin was activated")

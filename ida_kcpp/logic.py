@@ -12,7 +12,6 @@ import ida_bytes
 import ida_hexrays
 import ida_idaapi
 import ida_name
-import ida_struct
 import ida_typeinf
 import ida_xref
 import idautils
@@ -60,7 +59,8 @@ def init_if_needed(only_collect=True):
     logger.addHandler(f_handler)
 
     if only_collect:
-        ida_kernelcache.collect_class_info()
+        if not (hasattr(ida_kernelcache, "class_info") and "OSObject" in ida_kernelcache.class_info):
+            ida_kernelcache.collect_class_info()
     else:
         ida_kernelcache.kernelcache_process()
 
@@ -97,7 +97,7 @@ def find_vtable_funcptr_from_expr(e):
     if vtable_cand_expr.op != ida_hexrays.cot_memptr:
         return
     vtable_cand = utils.extract_struct_from_tinfo(vtable_cand_expr.type)
-    vtable_cand_struc_name = ida_struct.get_struc_name(vtable_cand.id)
+    vtable_cand_struc_name = utils.get_struct_name(vtable_cand)
     if vtable_cand_struc_name.endswith("::vtable"):
         return vtable_cand_struc_name[:-len("::vtable")], offset
 
@@ -135,9 +135,14 @@ def gather_funcs_from_descendants(ancestor_classname, offset_in_vtable):
 def perform_initial_sync(ui_update_func):
     fix_classes_vtables_top_down(ui_update_func)
     path = pathlib.Path(__file__)
-    git_dir = path.parent.parent.absolute()
-    hash_file = subprocess.check_output(['git', '-C', git_dir, 'rev-parse', 'HEAD']).decode('ascii').strip('\n')
-    config["commit_hash"] = hash_file
+    # Resolve symlinks to find the actual git repo
+    git_dir = path.resolve().parent.parent
+    try:
+        hash_file = subprocess.check_output(['git', '-C', git_dir, 'rev-parse', 'HEAD']).decode('ascii').strip('\n')
+        config["commit_hash"] = hash_file
+    except subprocess.CalledProcessError:
+        # Not running from a git repo
+        config["commit_hash"] = "unknown"
 
 
 @utils.batch_mode
@@ -166,27 +171,15 @@ def find_own_vmethods_offset_in_vtable(class_name):
     if vtable_sptr is None:
         logger.warning(f"Couldn't find struc {class_name}::vtable")
         return
-    offset = 0
-    while offset != ida_idaapi.BADADDR and offset < ida_struct.get_struc_size(vtable_sptr):
-        curr_vtable_member = ida_struct.get_member(vtable_sptr, offset)
-        if not curr_vtable_member:
-            logger.warning(f"Couldn't find struc member at {class_name}::vtable offset {offset}")
-            return
+    for curr_vtable_member, offset in utils.iterate_struct_members(vtable_sptr):
         vmethods_sptr = utils.get_member_substruct(curr_vtable_member)
         if not vmethods_sptr:
-            logger.warning(
-                f"{class_name}::vtable can't find vmethods struct in offset {hex(offset)}"
-            )
-            return
-        vmethods_name = ida_struct.get_struc_name(vmethods_sptr.id)
-        if not vmethods_name.endswith("::vmethods"):
-            logger.warning(
-                f"{class_name}::vtable can't find vmethods struct in offset {hex(offset)}"
-            )
-            return
+            continue
+        vmethods_name = utils.get_struct_name(vmethods_sptr)
+        if not vmethods_name or not vmethods_name.endswith("::vmethods"):
+            continue
         if "".join(vmethods_name.split(":")[:-1]) == class_name:
             return offset
-        offset = ida_struct.get_struc_next_offset(vtable_sptr, offset)
     return None
 
 
@@ -213,7 +206,7 @@ def find_vmethod_name_candidates(class_name, offset_in_vtable, member_name):
     for imple_class_name, impl in all_impls:
         if impl not in unique_impls:
             unique_impls[impl] = imple_class_name
-            method_name = extract_method_name(impl)
+            method_name = extract_method_name_from_func_ea(impl)
             if method_name and method_name != member_name:
                 cands.append((method_name, impl))
     if not cands:
@@ -239,7 +232,7 @@ def link_vfuncs_to_vmethod(class_name, offset_in_vmethods, offset_in_vtable, all
 
 
 def fix_virtual_method(class_name, vmethods_sptr, vmethods_member, vmethods_offset, vmethods_offset_in_vtable):
-    member_name = ida_struct.get_member_name(vmethods_member.id)
+    member_name = utils.get_member_name(vmethods_member)
     offset_in_vtable = vmethods_offset + vmethods_offset_in_vtable
     chosen_method_name, unique_impls, all_impls = find_vmethod_name_candidates(class_name,
                                                                                offset_in_vtable, member_name)
@@ -247,14 +240,15 @@ def fix_virtual_method(class_name, vmethods_sptr, vmethods_member, vmethods_offs
     if not (chosen_method_name and unique_impls):
         return
     if chosen_method_name != member_name:
-        ida_struct.set_member_name(vmethods_sptr, vmethods_member.soff, chosen_method_name)
+        utils.set_member_name(vmethods_sptr, vmethods_member.soff, chosen_method_name)
     for impl, impl_class_name in unique_impls.items():
         full_name = utils.generate_method_name(impl_class_name, chosen_method_name)
         utils.set_func_name(impl, full_name)
-        func_type = utils.decompile_and_update_this(impl, utils.get_typeinf_ptr(impl_class_name))
-        if func_type and impl_class_name == class_name:
-            func_ptr = utils.get_typeinf_ptr(func_type)
-            ida_struct.set_member_tinfo(vmethods_sptr, vmethods_member, 0, func_ptr, ida_typeinf.TINFO_DEFINITE)
+        if impl_class_name == class_name:
+            func_type = utils.decompile_and_update_this(impl, utils.get_typeinf_ptr(impl_class_name))
+            if func_type:
+                func_ptr = utils.get_typeinf_ptr(func_type)
+                utils.set_member_tinfo(vmethods_sptr, vmethods_member, func_ptr, ida_typeinf.TINFO_DEFINITE)
 
 
 def fix_vtable(class_info):
@@ -299,15 +293,15 @@ def rename_virtual_method(class_name, vtable_offset, vmethod_offset, method_name
         for i in range(20):
             if i > 0:
                 member_name = method_name + "_" + str(i)
-            if ida_struct.set_member_name(vmethod_sptr, vmethod_offset, member_name):
+            if utils.set_member_name(vmethod_sptr, vmethod_offset, member_name):
                 break
         else:
             logger.warning(f"Couldn't rename f{class_name}::vemthod at offset {hex(vmethod_offset)} to {method_name}")
             return
-        member = ida_struct.get_member(vmethod_sptr, vmethod_offset)
-        comment = ida_struct.get_member_cmt(member.id, 1)
+        member = utils.get_member_by_offset(vmethod_sptr, vmethod_offset)
+        comment = utils.get_member_cmt(member)
         if comment and comment.startswith("Conflicting virtual function name"):
-            ida_struct.set_member_cmt(member, '', 1)
+            utils.set_member_cmt(vmethod_sptr, member, '', 1)
     impls = gather_funcs_from_descendants(class_name, vtable_offset)
     changed_funcs = set()
     for _, impl_ea in impls:
@@ -328,19 +322,19 @@ def virtual_method_prototype_changed(ea, vfunc_metadata, method_details):
     vtable_offset = vfunc_metadata.vtable_offset
     vmethods_offset = vfunc_metadata.vmethod_offset
     vmethods_sptr = utils.get_sptr_by_name(class_name + "::vmethods")
-    vmethods_member = ida_struct.get_member(vmethods_sptr, vmethods_offset)
+    vmethods_member = utils.get_member_by_offset(vmethods_sptr, vmethods_offset)
     function_tinfo = ida_typeinf.tinfo_t()
     new_details = utils.duplicate_details_with_this(method_details, utils.get_typeinf_ptr(class_name))
     function_tinfo.create_func(new_details)
     func_ptr = utils.get_typeinf_ptr(function_tinfo)
-    ida_struct.set_member_tinfo(vmethods_sptr, vmethods_member, 0, func_ptr, ida_typeinf.TINFO_DEFINITE)
+    utils.set_member_tinfo(vmethods_sptr, vmethods_member, func_ptr, ida_typeinf.TINFO_DEFINITE)
     propagate_vmethod_member_prototype_change(class_name, vtable_offset, method_details, ea)
 
 
 def virtual_method_member_prototype_changed(class_name, mptr):
     method_details = ida_typeinf.func_type_data_t()
-    funcptr = ida_typeinf.tinfo_t()
-    if not ida_struct.get_member_tinfo(funcptr, mptr):
+    funcptr = utils.get_member_tinfo(mptr)
+    if funcptr is None:
         return
     if not funcptr.is_funcptr():
         return
@@ -365,13 +359,11 @@ def propagate_vmethod_member_prototype_change(class_name, vtable_offset, method_
 @vfunc_metadata
 def get_member_id_for_vfunc(ea, func_metadata):
     if utils.is_func_start(ea):
-        sid = ida_struct.get_struc_id(func_metadata.base_class + "::vmethods")
-        if sid is ida_idaapi.BADADDR:
-            return
-        sptr = ida_struct.get_struc(sid)
+        sptr = utils.get_struct_by_name(func_metadata.base_class + "::vmethods")
         if not sptr:
             return
-        mid = ida_struct.get_member_id(sptr, func_metadata.vmethod_offset)
+        member = utils.get_member_by_offset(sptr, func_metadata.vmethod_offset)
+        mid = utils.get_member_tid(member)
         if mid == ida_idaapi.BADADDR:
             return
         return mid
@@ -384,28 +376,28 @@ def shrink_struct(name, how_much):
     sptr = utils.get_sptr_by_name(name)
     if not sptr:
         raise RuntimeError("struct {name} does not exist")
-    curr_size = ida_struct.get_struc_size(sptr)
+    curr_size = utils.get_struct_size(sptr)
     assert how_much < curr_size
 
     new_size = curr_size - how_much
 
     # remove last members
-    ida_struct.del_struc_members(sptr, new_size, curr_size + 1)
-    curr_size = ida_struct.get_struc_size(sptr)
+    utils.del_struct_members(sptr, new_size, curr_size + 1)
+    curr_size = utils.get_struct_size(sptr)
     assert curr_size <= new_size
 
     # add padding member if required
     if curr_size < new_size:
-        ida_struct.add_struc_member(sptr, None, new_size - 1, 0, None, 1)
+        utils.add_struct_member(sptr, None, new_size - 1, None, 1)
 
     # verify that we're alright
-    assert ida_struct.get_struc_size(sptr) == new_size
+    assert utils.get_struct_size(sptr) == new_size
     return sptr
 
 
 def get_fields_member_in_iokit_class(class_name):
     class_sptr = utils.get_sptr_by_name(class_name)
-    fields_member = ida_struct.get_member_by_name(class_sptr, class_name)
+    fields_member = utils.get_member_by_name(class_sptr, class_name)
     if not fields_member:
         raise RuntimeError(f"Class {class_name} does not have {class_name} member")
     member_tinfo = utils.get_member_tinfo(fields_member)
@@ -419,14 +411,14 @@ def fix_containing_struct(class_name, fields_member_offset, next_member_offset, 
     sptr = utils.get_sptr_by_name(class_name)
     if not sptr:
         return
-    fields_class_name = ida_struct.get_struc_name(fields_sptr.id)[:-len("::fields")]
-    utils.add_struct_substruct_member(sptr, fields_class_name, fields_member_offset, fields_sptr.id)
-    next_member = ida_struct.get_member(sptr, next_member_offset)
+    fields_class_name = utils.get_struct_name(fields_sptr)[:-len("::fields")]
+    utils.add_struct_substruct_member(sptr, fields_class_name, fields_member_offset, fields_sptr.get_tid())
+    next_member = utils.get_member_by_offset(sptr, next_member_offset)
     if next_member:
-        next_member_fields = utils.get_struc_from_tinfo(utils.get_member_tinfo(next_member))
+        next_member_fields = utils.get_struct_from_tinfo(utils.get_member_tinfo(next_member))
         if not next_member_fields:
             return
-        next_member_name = ida_struct.get_member_name(next_member.id)
+        next_member_name = utils.get_member_name(next_member)
         return sptr, next_member_name, next_member_fields
 
 
@@ -453,16 +445,17 @@ def shrink_iokit_class(class_name, how_much):
         if to_fix:
             structs_to_fix.append(to_fix)
 
-    next_member_new_offset = fields_member_offset + ida_struct.get_struc_size(fields_sptr)
+    next_member_new_offset = fields_member_offset + utils.get_struct_size(fields_sptr)
     for sptr, member_name, next_member_fields in structs_to_fix:
-        if next_member_fields.id not in expanded_fields:
-            expanded_fields.add(next_member_fields.id)
-            old_struct_size = ida_struct.get_struc_size(next_member_fields)
-            ida_struct.del_struc_member(next_member_fields, old_struct_size)
-            if ida_struct.get_struc_size(next_member_fields) < old_struct_size:
-                ida_struct.add_struc_member(next_member_fields, None, old_struct_size - 1, 0, None, 1)
-            ida_struct.expand_struc(next_member_fields, 0, how_much)
-        utils.add_struct_substruct_member(sptr, member_name, next_member_new_offset, next_member_fields.id)
+        next_member_tid = next_member_fields.get_tid()
+        if next_member_tid not in expanded_fields:
+            expanded_fields.add(next_member_tid)
+            old_struct_size = utils.get_struct_size(next_member_fields)
+            utils.del_struct_member(next_member_fields, old_struct_size)
+            if utils.get_struct_size(next_member_fields) < old_struct_size:
+                utils.add_struct_member(next_member_fields, None, old_struct_size - 1, None, 1)
+            utils.expand_struct(next_member_fields, 0, how_much)
+        utils.add_struct_substruct_member(sptr, member_name, next_member_new_offset, next_member_tid)
 
     ida_auto.enable_auto(old_auto_analysis_status)
 
@@ -495,7 +488,7 @@ def _load_function_symbol(ea, name):
             existing_name = ida_name.get_ea_name(ea)
             if existing_name == name: return
             name += f'_OR_{existing_name}'
-        ida_name.set_name(ea, name, ida_name.SN_AUTO | ida_name.SN_FORCE)
+        ida_name.set_name(ea, name, ida_name.SN_AUTO | ida_name.SN_FORCE | ida_name.SN_NOWARN)
         return
     
     # Using gathered metadata, find the ::vmethods struct this vfunction is defined in.
@@ -507,11 +500,11 @@ def _load_function_symbol(ea, name):
     if not sptr:
         logger.warning(f"{vmethods_struct_name} structure not found.")
         return
-    member = ida_struct.get_member(sptr, vfunc_metadata.vmethod_offset)
+    member = utils.get_member_by_offset(sptr, vfunc_metadata.vmethod_offset)
     if not member:
         logger.warning(f"Could not find struct {vmethods_struct_name} member at offset {vfunc_metadata.vmethod_offset}")
         return
-    member_name = ida_struct.get_member_name(member.id)
+    member_name = utils.get_member_name(member)
     sym_method_name = extract_method_name(name)
     if sym_method_name is None:
         logger.warning(f"Func {name} in ea {hex(ea)} can't be demangled")
@@ -536,7 +529,7 @@ def _load_function_symbol(ea, name):
     set_member_name = 'CONFLICT_' not in member_name
     rename_virtual_method(vfunc_metadata.base_class, vfunc_metadata.vtable_offset, 
                           vfunc_metadata.vmethod_offset, conflict_name, set_member_name)
-    comment = ida_struct.get_member_cmt(member.id, 1)
+    comment = utils.get_member_cmt(member)
     if not comment:
         comment = 'Conflicting virtual function name with:\n%s @ 0x%x' % (member_name, ea)
     demangled_name = idc.demangle_name(name, idc.get_inf_attr(idc.INF_LONG_DN))
@@ -544,7 +537,7 @@ def _load_function_symbol(ea, name):
         comment += '\n%s @ 0x%x' % (demangled_name, ea)
     else:
         comment += '\n%s @ 0x%x' % (name, ea)
-    ida_struct.set_member_cmt(member, comment, 1)
+    utils.set_member_cmt(sptr, member, comment, 1)
     
 def import_function_symbols(filepath):
     if filepath.endswith(".json"):

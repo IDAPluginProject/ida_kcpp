@@ -4,7 +4,6 @@ import ida_idp
 import ida_kernwin
 import ida_moves
 import ida_name
-import ida_struct
 import ida_typeinf
 import idaapi
 
@@ -112,17 +111,18 @@ class VirtualFuncsSynchronizer(ida_idp.IDB_Hooks):
         idaapi.execute_ui_requests([lambda: self._update_vmethods(name)])
     
     def _update_vmethods(self, name):
-        sid = ida_struct.get_struc_id(name)
-        sptr = ida_struct.get_struc(sid)
+        sptr = utils.get_struct_by_name(name)
+        if not sptr:
+            return
         self.unhook()
         class_name = name.split("::")[0]
-        for mptr in sptr.members:
+        for mptr, _ in utils.iterate_struct_members(sptr):
             vtable_offset = logic.find_own_vmethods_offset_in_vtable(class_name) + mptr.soff
             generic_method_name = f"method_{vtable_offset // 8}"
             logic.virtual_method_member_renamed(class_name, mptr.soff, generic_method_name)
-        for mptr in sptr.members:
-            member_name = ida_struct.get_member_name(mptr.id)
-            logic.virtual_method_member_renamed(class_name, mptr.soff, member_name)    
+        for mptr, _ in utils.iterate_struct_members(sptr):
+            member_name = utils.get_member_name(mptr)
+            logic.virtual_method_member_renamed(class_name, mptr.soff, member_name)
             logic.virtual_method_member_prototype_changed(class_name, mptr)
         self.hook()
         
@@ -139,71 +139,159 @@ class VirtualFuncsSynchronizer(ida_idp.IDB_Hooks):
 
 
 class StructsDoubleColonHooks(ida_kernwin.View_Hooks):
+    """Handles double-click navigation in the Local Types view.
+    
+    In IDA 9, the Structures view was replaced by the Local Types view.
+    This hook enables navigation from type references (e.g., OSObject::vtable)
+    and vmethods members to their definitions or implementations.
+    """
     def __init__(self):
         super(StructsDoubleColonHooks, self).__init__()
         self.selected_expr = None
         self.double_click_triggered = False
 
-    def view_click(self, viewer, point):
-        widget_type = ida_kernwin.get_widget_type(viewer)
-        # Make sure the widget_type is of the Structures viewer
-        if widget_type != 28:
+    def view_click(self, view, event):
+        widget_type = ida_kernwin.get_widget_type(view)
+        # In IDA 9, the Local Types view uses BWN_TILIST (58)
+        if widget_type != ida_kernwin.BWN_TILIST:
             return
         if self.double_click_triggered:
             self.double_click_triggered = False
             return
-        self.selected_expr = ui_utils.get_wrapped_word_from_viewer(viewer)
+        self.selected_expr = ui_utils.get_wrapped_word_from_viewer(view)
 
-    def view_dblclick(self, viewer, point):
-        widget_type = ida_kernwin.get_widget_type(viewer)
-        # Make sure the widget_type is of the Structures viewer
-        if widget_type != 28:
+    def view_dblclick(self, view, event):
+        widget_type = ida_kernwin.get_widget_type(view)
+        # In IDA 9, the Local Types view uses BWN_TILIST (58)
+        if widget_type != ida_kernwin.BWN_TILIST:
             return
         self.double_click_triggered = True
         if not self.selected_expr:
             return
         expr = self.selected_expr
         e = ida_moves.lochist_entry_t()
-        if not ida_kernwin.get_custom_viewer_location(e, viewer):
+        if not ida_kernwin.get_custom_viewer_location(e, view):
             return
         place = e.place()
         if not place:
             return
-        struct_place = place.as_structplace_t(place)
+        # In IDA 9, only tiplace_t is used (structplace_t was removed)
+        tiplace = place.as_tiplace_t(place) if hasattr(place, "as_tiplace_t") else None
+        if not tiplace:
+            return
 
         if "::" in expr and " " not in expr:
             # Case click on struct type such as "OSObject::field"
-            sid = ida_struct.get_struc_id(expr)
+            sid = utils.get_struct_tid_by_name(expr)
             if sid == ida_idaapi.BADADDR:
                 return
-            sidx = ida_struct.get_struc_idx(sid)
-            if sid == ida_idaapi.BADADDR:
+            sidx = utils.get_struct_ordinal(sid)
+            if sidx == 0:
                 return
-            struct_place.idx = sidx
-            struct_place.offset = 0
-            e.set_place(struct_place)
-            ida_kernwin.custom_viewer_jump(viewer, e)
+            ida_kernwin.open_loctypes_window(sidx)
             self.selected_expr = None
         else:
-            sid = ida_struct.get_struc_by_idx(struct_place.idx)
             # Checking for a case click on vmethod
-            if sid == ida_idaapi.BADADDR:
-                return
-            struct_name = ida_struct.get_struc_name(sid)
-            if not struct_name.endswith("::vmethods"):
-                return
-            sptr = ida_struct.get_struc(sid)
-            if not sptr:
-                return
-            member = ida_struct.get_member(sptr, struct_place.offset)
-            name = ida_struct.get_member_name(member.id)
-            if not name:
-                return
-            if name == expr:
-                # clicked on method_x inside Y::vmethods
-                class_name = "::".join(struct_name.split("::")[:-1])
-                vmethod_offset_in_obj = logic.find_own_vmethods_offset_in_vtable(class_name) + struct_place.offset
-                jump_to_virtual_func(class_name, vmethod_offset_in_obj)
+            navigate_to_vmethod_impl(tiplace.ordinal, expr)
+
+
+def navigate_to_vmethod_impl(type_ordinal, expr):
+    """Navigate to virtual method implementation from Local Types view.
+    
+    Args:
+        type_ordinal: The ordinal of the type in Local Types
+        expr: The expression/word under cursor (may include * prefix)
+    
+    Returns:
+        True if navigation succeeded, False otherwise
+    """
+    sptr = utils.get_struct_by_ordinal(type_ordinal)
+    if not sptr:
+        return False
+    
+    struct_name = utils.get_struct_name(sptr)
+    if not struct_name or not struct_name.endswith("::vmethods"):
+        return False
+    
+    # Strip pointer indicator from expression (e.g., "*methodName" -> "methodName")
+    member_name = expr.lstrip('*')
+    member = utils.get_member_by_name(sptr, member_name)
+    if not member:
+        return False
+    
+    name = utils.get_member_name(member)
+    if not name or name != member_name:
+        return False
+    
+    # Navigate to the method implementation
+    class_name = "::".join(struct_name.split("::")[:-1])
+    vmethod_offset_in_obj = logic.find_own_vmethods_offset_in_vtable(class_name) + member.soff
+    jump_to_virtual_func(class_name, vmethod_offset_in_obj)
+    return True
+
+
+
+class JumpToVMethodHandler(ida_kernwin.action_handler_t):
+    """Action handler for jumping to virtual method implementation.
+    
+    Provides Cmd+Enter (macOS) / Ctrl+Enter (Windows/Linux) shortcut
+    in Local Types view to navigate to method implementations.
+    """
+    ACTION_NAME = 'kcpp:jump_to_vmethod'
+    ACTION_SHORTCUT = 'Meta+Enter'
+    ACTION_LABEL = 'Jump to virtual method implementation'
+    ACTION_TOOLTIP = 'Navigate to the virtual method implementation (kcpp)'
+
+    def __init__(self):
+        ida_kernwin.action_handler_t.__init__(self)
+
+    def activate(self, ctx):
+        widget = ctx.widget
+        if not widget:
+            return 0
+        
+        # Get the word under cursor
+        expr = ui_utils.get_wrapped_word_from_viewer(widget)
+        if not expr:
+            return 0
+        
+        # Get current location to find the struct
+        e = ida_moves.lochist_entry_t()
+        if not ida_kernwin.get_custom_viewer_location(e, widget):
+            return 0
+        place = e.place()
+        if not place:
+            return 0
+        
+        tiplace = place.as_tiplace_t(place) if hasattr(place, 'as_tiplace_t') else None
+        if not tiplace:
+            return 0
+        
+        return 1 if navigate_to_vmethod_impl(tiplace.ordinal, expr) else 0
+
+    def update(self, ctx):
+        # Only enable in Local Types view
+        if ctx.widget_type == ida_kernwin.BWN_TILIST:
+            return ida_kernwin.AST_ENABLE
+        return ida_kernwin.AST_DISABLE
+
+    @classmethod
+    def register(cls):
+        """Register the action with IDA."""
+        action_desc = ida_kernwin.action_desc_t(
+            cls.ACTION_NAME,
+            cls.ACTION_LABEL,
+            cls(),
+            cls.ACTION_SHORTCUT,
+            cls.ACTION_TOOLTIP,
+            -1
+        )
+        return ida_kernwin.register_action(action_desc)
+
+    @classmethod
+    def unregister(cls):
+        """Unregister the action from IDA."""
+        return ida_kernwin.unregister_action(cls.ACTION_NAME)
 
 
 def open_smart_xrefs():

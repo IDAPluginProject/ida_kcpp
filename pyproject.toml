@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=80", "wheel", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ida-kcpp"
+dynamic = ["version"]
+description = "IDA plugin for C++ navigation in iOS kernelcaches"
+dependencies = [
+    "ida-kernelcache",
+    "ida-netnode",
+]
+
+[project.entry-points."ida_plugins"]
+ida_kcpp = "ida_kcpp_plugin"
+
+[tool.setuptools]
+packages = ["ida_kcpp"]
+py-modules = ["ida_kcpp_plugin"]
+
+[tool.setuptools_scm]
